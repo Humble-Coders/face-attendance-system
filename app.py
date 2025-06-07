@@ -4,7 +4,6 @@ import cv2
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests
 import base64
 from PIL import Image
 import io
@@ -13,16 +12,11 @@ from firebase_admin import credentials, firestore
 from datetime import datetime
 import logging
 import json
-import time
-import face_recognition
+import tempfile
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Add Silent Face Anti-Spoofing to path
-sys.path.append('/app/silent-antispoofing')
-sys.path.append('/app/silent-antispoofing/src')
 
 app = Flask(__name__)
 CORS(app)
@@ -30,90 +24,103 @@ CORS(app)
 # Initialize Firebase
 db = None
 try:
-    # Try to read from environment variable first
     firebase_creds = os.getenv('FIREBASE_CREDENTIALS')
     if firebase_creds:
         logger.info("Loading Firebase credentials from environment variable")
         cred_dict = json.loads(firebase_creds)
         cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        logger.info("Firebase initialized successfully")
     else:
-        # Fallback to file
-        cred = credentials.Certificate('/app/firebase-credentials.json')
-    
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    logger.info("Firebase initialized successfully")
+        logger.warning("No Firebase credentials found")
 except Exception as e:
     logger.error(f"Failed to initialize Firebase: {e}")
     db = None
 
-# Initialize Anti-Spoofing Service
-class AntiSpoofingService:
+# Initialize DeepFace Anti-Spoofing Service
+class DeepFaceAntiSpoofingService:
     def __init__(self):
-        self.model_dir = '/app/silent-antispoofing/resources/anti_spoof_models'
-        self.model_test = None
-        self.image_cropper = None
+        self.deepface = None
+        self.models_loaded = False
         
         try:
-            from anti_spoof_predict import AntiSpoofPredict
-            from generate_patches import CropImage
-            from utility import parse_model_name
+            from deepface import DeepFace
+            self.deepface = DeepFace
+            logger.info("DeepFace imported successfully")
             
-            self.model_test = AntiSpoofPredict(0)  # CPU device
-            self.image_cropper = CropImage()
-            self.parse_model_name = parse_model_name
-            logger.info("Anti-spoofing service initialized successfully")
+            # Test model loading
+            self._test_models()
         except Exception as e:
-            logger.error(f"Failed to initialize anti-spoofing: {e}")
+            logger.error(f"Failed to initialize DeepFace: {e}")
+    
+    def _test_models(self):
+        """Test if models can be loaded"""
+        try:
+            # Create a small test image
+            test_image = np.ones((100, 100, 3), dtype=np.uint8) * 128
+            
+            # Save to temporary file
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+                cv2.imwrite(tmp_file.name, test_image)
+                
+                # Test face extraction with anti-spoofing
+                result = self.deepface.extract_faces(
+                    img_path=tmp_file.name,
+                    anti_spoofing=True,
+                    enforce_detection=False
+                )
+                
+                # Clean up
+                os.unlink(tmp_file.name)
+                
+                self.models_loaded = True
+                logger.info("DeepFace models loaded and tested successfully")
+                
+        except Exception as e:
+            logger.error(f"DeepFace model test failed: {e}")
+            self.models_loaded = False
     
     def predict(self, image):
-        """Predict if face is real or fake"""
-        if self.model_test is None:
-            logger.warning("Anti-spoofing not available, using fallback")
+        """Predict if face is real or fake using DeepFace"""
+        if self.deepface is None or not self.models_loaded:
+            logger.warning("DeepFace not available, using basic check")
             return self.basic_liveness_check(image)
         
         try:
-            height, width, _ = image.shape
-            bbox = [0, 0, width, height]
-            
-            prediction = np.zeros((1, 3))
-            
-            # Check if model files exist
-            model_files = [f for f in os.listdir(self.model_dir) if f.endswith('.pth')]
-            if not model_files:
-                logger.warning("No model files found, using basic check")
-                return self.basic_liveness_check(image)
-            
-            for model_name in model_files:
-                h_input, w_input, model_type, scale = self.parse_model_name(model_name)
-                param = {
-                    "org_img": image,
-                    "bbox": bbox,
-                    "scale": scale,
-                    "out_w": w_input,
-                    "out_h": h_input,
-                    "crop": True,
-                }
-                if scale is None:
-                    param["crop"] = False
+            # Save image to temporary file
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+                cv2.imwrite(tmp_file.name, image)
                 
-                img = self.image_cropper.crop(**param)
-                pred = self.model_test.predict(img, os.path.join(self.model_dir, model_name))
-                prediction += pred
-            
-            # Calculate final score
-            label = np.argmax(prediction)
-            value = prediction[0][label] / len(model_files)
-            
-            logger.info(f"Anti-spoofing prediction: {value}")
-            return float(value)
-            
+                # Use DeepFace for anti-spoofing detection
+                result = self.deepface.extract_faces(
+                    img_path=tmp_file.name,
+                    anti_spoofing=True,
+                    enforce_detection=False
+                )
+                
+                # Clean up temporary file
+                os.unlink(tmp_file.name)
+                
+                if result and len(result) > 0:
+                    face_data = result[0]
+                    is_real = face_data.get('is_real', False)
+                    confidence = face_data.get('antispoof_score', 0.5)
+                    
+                    logger.info(f"DeepFace liveness result: real={is_real}, confidence={confidence}")
+                    
+                    # Return confidence score (0.0 to 1.0)
+                    return confidence if is_real else (1.0 - confidence)
+                else:
+                    logger.warning("No face detected by DeepFace")
+                    return self.basic_liveness_check(image)
+                    
         except Exception as e:
-            logger.error(f"Anti-spoofing prediction failed: {e}")
+            logger.error(f"DeepFace prediction failed: {e}")
             return self.basic_liveness_check(image)
     
     def basic_liveness_check(self, image):
-        """Basic fallback liveness check"""
+        """Fallback basic liveness check"""
         try:
             height, width = image.shape[:2]
             
@@ -126,7 +133,7 @@ class AntiSpoofingService:
             if mean_brightness < 30 or mean_brightness > 220:
                 return 0.3
             
-            # Check edge density (fake images often have different edge characteristics)
+            # Check edge density
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             edges = cv2.Canny(gray, 50, 150)
             edge_density = np.sum(edges > 0) / (height * width)
@@ -141,17 +148,25 @@ class AntiSpoofingService:
             return 0.1
 
 # Initialize services
-anti_spoof_service = AntiSpoofingService()
+anti_spoof_service = DeepFaceAntiSpoofingService()
 
-# Face Recognition Service using face_recognition library
-class FaceRecognitionService:
+# Face Recognition Service using DeepFace
+class DeepFaceFaceRecognitionService:
     def __init__(self):
-        self.known_face_encodings = {}
-        self.load_known_faces()
+        self.deepface = None
+        self.known_face_embeddings = {}
+        
+        try:
+            from deepface import DeepFace
+            self.deepface = DeepFace
+            logger.info("DeepFace face recognition initialized")
+            self.load_known_faces()
+        except Exception as e:
+            logger.error(f"Failed to initialize DeepFace recognition: {e}")
     
     def load_known_faces(self):
         """Load known faces from Firebase"""
-        if not db:
+        if not db or not self.deepface:
             return
         
         try:
@@ -160,75 +175,90 @@ class FaceRecognitionService:
             
             for doc in docs:
                 student_data = doc.to_dict()
-                if student_data.get('faceEncoding'):
-                    encoding = np.array(student_data['faceEncoding'])
-                    self.known_face_encodings[student_data['studentId']] = encoding
+                if student_data.get('faceEmbedding'):
+                    embedding = np.array(student_data['faceEmbedding'])
+                    self.known_face_embeddings[student_data['studentId']] = embedding
             
-            logger.info(f"Loaded {len(self.known_face_encodings)} known faces")
+            logger.info(f"Loaded {len(self.known_face_embeddings)} known face embeddings")
         except Exception as e:
             logger.error(f"Failed to load known faces: {e}")
     
-    def encode_face(self, image):
-        """Extract face encoding from image"""
-        try:
-            # Convert BGR to RGB
-            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            
-            # Find face locations
-            face_locations = face_recognition.face_locations(rgb_image)
-            
-            if not face_locations:
-                return None
-            
-            # Get face encodings
-            face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
-            
-            if face_encodings:
-                return face_encodings[0]
-            
+    def get_face_embedding(self, image):
+        """Extract face embedding using DeepFace"""
+        if not self.deepface:
             return None
+        
+        try:
+            # Save image to temporary file
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+                cv2.imwrite(tmp_file.name, image)
+                
+                # Get face embedding
+                embedding = self.deepface.represent(
+                    img_path=tmp_file.name,
+                    model_name='Facenet512',
+                    enforce_detection=False
+                )
+                
+                # Clean up
+                os.unlink(tmp_file.name)
+                
+                if embedding and len(embedding) > 0:
+                    return np.array(embedding[0]['embedding'])
+                
+                return None
+                
         except Exception as e:
-            logger.error(f"Face encoding failed: {e}")
+            logger.error(f"Face embedding extraction failed: {e}")
             return None
     
     def add_known_face(self, student_id, image):
         """Add a new face to known faces"""
-        encoding = self.encode_face(image)
-        if encoding is not None:
-            self.known_face_encodings[student_id] = encoding
-            return encoding.tolist()  # Convert to list for JSON storage
+        embedding = self.get_face_embedding(image)
+        if embedding is not None:
+            self.known_face_embeddings[student_id] = embedding
+            return embedding.tolist()  # Convert to list for JSON storage
         return None
     
-    def recognize_face(self, image, tolerance=0.6):
+    def recognize_face(self, image, threshold=0.7):
         """Recognize face in image"""
+        if not self.deepface:
+            return None, 0.0
+        
         try:
-            encoding = self.encode_face(image)
-            if encoding is None:
+            current_embedding = self.get_face_embedding(image)
+            if current_embedding is None:
                 return None, 0.0
             
-            if not self.known_face_encodings:
+            if not self.known_face_embeddings:
                 return None, 0.0
             
             # Compare with known faces
-            student_ids = list(self.known_face_encodings.keys())
-            known_encodings = list(self.known_face_encodings.values())
+            best_match = None
+            best_distance = float('inf')
             
-            matches = face_recognition.compare_faces(known_encodings, encoding, tolerance=tolerance)
-            face_distances = face_recognition.face_distance(known_encodings, encoding)
+            for student_id, known_embedding in self.known_face_embeddings.items():
+                # Calculate cosine distance
+                distance = np.linalg.norm(current_embedding - known_embedding)
+                
+                if distance < best_distance:
+                    best_distance = distance
+                    best_match = student_id
             
-            if True in matches:
-                best_match_index = np.argmin(face_distances)
-                if matches[best_match_index]:
-                    confidence = 1 - face_distances[best_match_index]
-                    return student_ids[best_match_index], confidence
+            # Convert distance to confidence score
+            confidence = max(0.0, 1.0 - (best_distance / 2.0))
             
-            return None, 0.0
+            if confidence >= threshold:
+                return best_match, confidence
+            
+            return None, confidence
+            
         except Exception as e:
             logger.error(f"Face recognition failed: {e}")
             return None, 0.0
 
 # Initialize face recognition service
-face_recognition_service = FaceRecognitionService()
+face_recognition_service = DeepFaceFaceRecognitionService()
 
 def base64_to_image(base64_string):
     """Convert base64 string to OpenCV image"""
@@ -247,26 +277,26 @@ def base64_to_image(base64_string):
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        "message": "Face Recognition Attendance System",
-        "version": "1.0.0",
+        "message": "Face Recognition Attendance System with DeepFace", 
+        "version": "2.0.0",
         "status": "running",
         "services": {
             "firebase": db is not None,
-            "anti_spoofing": anti_spoof_service.model_test is not None,
-            "face_recognition": True,
-            "known_faces": len(face_recognition_service.known_face_encodings)
+            "deepface_antispoofing": anti_spoof_service.models_loaded,
+            "deepface_recognition": face_recognition_service.deepface is not None,
+            "known_faces": len(face_recognition_service.known_face_embeddings)
         }
     })
 
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
-        "status": "healthy",
+        "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
         "firebase_connected": db is not None,
-        "anti_spoofing_ready": anti_spoof_service.model_test is not None,
-        "face_recognition_ready": True,
-        "known_faces_count": len(face_recognition_service.known_face_encodings)
+        "deepface_antispoofing_ready": anti_spoof_service.models_loaded,
+        "deepface_recognition_ready": face_recognition_service.deepface is not None,
+        "known_faces_count": len(face_recognition_service.known_face_embeddings)
     })
 
 @app.route('/register-student', methods=['POST'])
@@ -297,10 +327,10 @@ def register_student():
                 "liveness_score": liveness_score
             }), 400
         
-        # Extract face encoding
-        face_encoding = face_recognition_service.add_known_face(student_id, image)
-        if face_encoding is None:
-            return jsonify({"error": "No face detected in image"}), 400
+        # Extract face embedding
+        face_embedding = face_recognition_service.add_known_face(student_id, image)
+        if face_embedding is None:
+            return jsonify({"error": "No face detected in image or face extraction failed"}), 400
         
         # Save to Firebase
         if db:
@@ -312,7 +342,7 @@ def register_student():
             student_data = {
                 'studentId': student_id,
                 'name': name,
-                'faceEncoding': face_encoding,
+                'faceEmbedding': face_embedding,
                 'livenessScore': liveness_score,
                 'registeredAt': datetime.now(),
                 'isActive': True
@@ -435,7 +465,7 @@ def get_students():
         
         for doc in docs:
             student_data = doc.to_dict()
-            # Don't return face encoding in the list
+            # Don't return face embedding in the list
             students.append({
                 'studentId': student_data.get('studentId'),
                 'name': student_data.get('name'),
@@ -474,7 +504,7 @@ def get_attendance():
             })
         
         return jsonify({
-            "attendance": attendance_records,
+            "attendance": attendance_records, 
             "count": len(attendance_records),
             "date": date_param
         })
@@ -491,7 +521,7 @@ def reload_faces():
         return jsonify({
             "success": True,
             "message": "Known faces reloaded",
-            "count": len(face_recognition_service.known_face_encodings)
+            "count": len(face_recognition_service.known_face_embeddings)
         })
     except Exception as e:
         logger.error(f"Failed to reload faces: {e}")
