@@ -5,7 +5,11 @@ Pillow==10.0.0
 requests==2.31.0
 firebase-admin==6.2.0
 gunicorn==21.2.0
-deepface==0.0.79
-tf-keras==2.15.0
-tensorflow==2.15.0
 opencv-python-headless==4.8.0.74
+
+# Optimized TensorFlow and DeepFace
+tensorflow-cpu==2.15.0     # CPU-only version (much lighter than full TensorFlow)
+deepface==0.0.79
+
+# Note: Using tensorflow-cpu instead of tensorflow saves ~500MB memory
+# DeepFace will lazy-load only when needed, not during startup
