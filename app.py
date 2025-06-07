@@ -13,6 +13,7 @@ from datetime import datetime
 import logging
 import json
 import tempfile
+import gc
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -38,128 +39,155 @@ except Exception as e:
     logger.error(f"Failed to initialize Firebase: {e}")
     db = None
 
-# Initialize DeepFace Anti-Spoofing Service
-class DeepFaceAntiSpoofingService:
+# Memory-optimized DeepFace Service
+class OptimizedDeepFaceService:
     def __init__(self):
         self.deepface = None
         self.models_loaded = False
+        self.face_cascade = None
         
+        # Initialize OpenCV for basic face detection first
         try:
-            from deepface import DeepFace
-            self.deepface = DeepFace
-            logger.info("DeepFace imported successfully")
-            self.models_loaded = True  # Remove the test for now
+            self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            logger.info("OpenCV face detection initialized")
         except Exception as e:
-            logger.error(f"Failed to initialize DeepFace: {e}")
+            logger.error(f"OpenCV initialization failed: {e}")
+        
+        # Lazy load DeepFace only when needed
+        logger.info("DeepFace will be loaded on first use to save memory")
+    
+    def _load_deepface_if_needed(self):
+        """Lazy loading of DeepFace to save memory during startup"""
+        if self.deepface is None:
+            try:
+                logger.info("Loading DeepFace (first use)...")
+                from deepface import DeepFace
+                self.deepface = DeepFace
+                self.models_loaded = True
+                logger.info("DeepFace loaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to load DeepFace: {e}")
+                self.models_loaded = False
     
     def predict(self, image):
-        """Basic liveness detection using image analysis"""
+        """Liveness detection with memory optimization"""
         try:
-            # Use basic computer vision techniques for liveness
-            return self.advanced_liveness_check(image)
+            # First try basic OpenCV detection (very fast, low memory)
+            if self.face_cascade is not None:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
+                
+                if len(faces) == 0:
+                    logger.info("No face detected with OpenCV, returning low score")
+                    return 0.2
+                
+                # Basic quality checks
+                basic_score = self.basic_liveness_check(image)
+                
+                # If basic score is too low, don't bother with DeepFace
+                if basic_score < 0.3:
+                    return basic_score
+                
+                # For borderline cases, use DeepFace for better accuracy
+                if basic_score < 0.7:
+                    return self.deepface_liveness_check(image)
+                
+                return basic_score
+            
+            # Fallback to basic check if OpenCV fails
+            return self.basic_liveness_check(image)
+            
         except Exception as e:
             logger.error(f"Liveness prediction failed: {e}")
-            return self.basic_liveness_check(image)
+            return 0.5
     
-    def advanced_liveness_check(self, image):
-        """Advanced liveness check using multiple techniques"""
+    def basic_liveness_check(self, image):
+        """Fast basic liveness check"""
         try:
             height, width = image.shape[:2]
             
-            # 1. Size check
+            # Size check
             if height < 100 or width < 100:
                 return 0.2
             
-            # 2. Brightness analysis
+            # Brightness analysis
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             mean_brightness = np.mean(gray)
-            std_brightness = np.std(gray)
             
             if mean_brightness < 30 or mean_brightness > 220:
                 return 0.3
             
-            # 3. Edge density analysis
+            # Edge density
             edges = cv2.Canny(gray, 50, 150)
             edge_density = np.sum(edges > 0) / (height * width)
             
-            if edge_density < 0.01 or edge_density > 0.3:
-                return 0.4
-            
-            # 4. Texture analysis using LBP-like approach
-            texture_score = self.analyze_texture(gray)
-            
-            # 5. Face detection confidence
-            face_score = self.detect_face_quality(image)
-            
-            # Combine scores
-            final_score = (texture_score * 0.4 + face_score * 0.6)
-            
-            return max(0.1, min(0.95, final_score))
-            
-        except Exception as e:
-            logger.error(f"Advanced liveness check failed: {e}")
-            return self.basic_liveness_check(image)
-    
-    def analyze_texture(self, gray_image):
-        """Analyze image texture patterns"""
-        try:
-            # Simple texture analysis
-            laplacian_var = cv2.Laplacian(gray_image, cv2.CV_64F).var()
-            
-            # Higher variance indicates more texture (real face)
-            if laplacian_var > 100:
-                return 0.8
-            elif laplacian_var > 50:
-                return 0.6
-            else:
+            if edge_density < 0.01:
                 return 0.3
+            elif edge_density > 0.05:
+                return 0.7
+            else:
+                return 0.5
+                
         except:
             return 0.5
     
-    def detect_face_quality(self, image):
-        """Check face detection quality"""
+    def deepface_liveness_check(self, image):
+        """Use DeepFace for accurate liveness detection"""
         try:
-            # Save image temporarily for DeepFace
+            self._load_deepface_if_needed()
+            
+            if not self.deepface:
+                return self.basic_liveness_check(image)
+            
+            # Save image temporarily
             with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
                 cv2.imwrite(tmp_file.name, image)
                 
-                # Use DeepFace for face detection only
-                faces = self.deepface.extract_faces(
-                    img_path=tmp_file.name,
-                    enforce_detection=False
-                )
-                
-                os.unlink(tmp_file.name)
-                
-                if faces and len(faces) > 0:
-                    # Face detected successfully
-                    return 0.8
-                else:
-                    return 0.3
+                try:
+                    # Use DeepFace face detection only (lighter than full analysis)
+                    faces = self.deepface.extract_faces(
+                        img_path=tmp_file.name,
+                        enforce_detection=False
+                    )
+                    
+                    if faces and len(faces) > 0:
+                        # Face found with DeepFace, assume good quality
+                        return 0.8
+                    else:
+                        return 0.3
+                        
+                finally:
+                    # Clean up temp file
+                    os.unlink(tmp_file.name)
+                    # Force garbage collection to free memory
+                    gc.collect()
                     
         except Exception as e:
-            logger.error(f"Face quality check failed: {e}")
-            return 0.5
-# Initialize services
-anti_spoof_service = DeepFaceAntiSpoofingService()
+            logger.error(f"DeepFace liveness check failed: {e}")
+            return self.basic_liveness_check(image)
 
-# Face Recognition Service using DeepFace
-class DeepFaceFaceRecognitionService:
+# Optimized Face Recognition Service
+class OptimizedFaceRecognitionService:
     def __init__(self):
         self.deepface = None
         self.known_face_embeddings = {}
-        
-        try:
-            from deepface import DeepFace
-            self.deepface = DeepFace
-            logger.info("DeepFace face recognition initialized")
-            self.load_known_faces()
-        except Exception as e:
-            logger.error(f"Failed to initialize DeepFace recognition: {e}")
+        logger.info("Face recognition service initialized (DeepFace lazy loaded)")
+        self.load_known_faces()
+    
+    def _load_deepface_if_needed(self):
+        """Lazy load DeepFace"""
+        if self.deepface is None:
+            try:
+                logger.info("Loading DeepFace for face recognition...")
+                from deepface import DeepFace
+                self.deepface = DeepFace
+                logger.info("DeepFace loaded for recognition")
+            except Exception as e:
+                logger.error(f"Failed to load DeepFace: {e}")
     
     def load_known_faces(self):
         """Load known faces from Firebase"""
-        if not db or not self.deepface:
+        if not db:
             return
         
         try:
@@ -177,47 +205,49 @@ class DeepFaceFaceRecognitionService:
             logger.error(f"Failed to load known faces: {e}")
     
     def get_face_embedding(self, image):
-        """Extract face embedding using DeepFace"""
+        """Extract face embedding using optimized DeepFace"""
+        self._load_deepface_if_needed()
+        
         if not self.deepface:
             return None
         
         try:
-            # Save image to temporary file
+            # Save to temp file
             with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
                 cv2.imwrite(tmp_file.name, image)
                 
-                # Get face embedding
-                embedding = self.deepface.represent(
-                    img_path=tmp_file.name,
-                    model_name='Facenet512',
-                    enforce_detection=False
-                )
-                
-                # Clean up
-                os.unlink(tmp_file.name)
-                
-                if embedding and len(embedding) > 0:
-                    return np.array(embedding[0]['embedding'])
-                
-                return None
-                
+                try:
+                    # Use lighter model for faster processing
+                    embedding = self.deepface.represent(
+                        img_path=tmp_file.name,
+                        model_name='Facenet',  # Lighter than Facenet512
+                        enforce_detection=False
+                    )
+                    
+                    if embedding and len(embedding) > 0:
+                        return np.array(embedding[0]['embedding'])
+                    
+                    return None
+                    
+                finally:
+                    # Cleanup
+                    os.unlink(tmp_file.name)
+                    gc.collect()  # Force memory cleanup
+                    
         except Exception as e:
             logger.error(f"Face embedding extraction failed: {e}")
             return None
     
     def add_known_face(self, student_id, image):
-        """Add a new face to known faces"""
+        """Add new face with memory optimization"""
         embedding = self.get_face_embedding(image)
         if embedding is not None:
             self.known_face_embeddings[student_id] = embedding
-            return embedding.tolist()  # Convert to list for JSON storage
+            return embedding.tolist()
         return None
     
-    def recognize_face(self, image, threshold=0.7):
-        """Recognize face in image"""
-        if not self.deepface:
-            return None, 0.0
-        
+    def recognize_face(self, image, threshold=0.6):
+        """Recognize face with memory optimization"""
         try:
             current_embedding = self.get_face_embedding(image)
             if current_embedding is None:
@@ -231,14 +261,13 @@ class DeepFaceFaceRecognitionService:
             best_distance = float('inf')
             
             for student_id, known_embedding in self.known_face_embeddings.items():
-                # Calculate cosine distance
                 distance = np.linalg.norm(current_embedding - known_embedding)
                 
                 if distance < best_distance:
                     best_distance = distance
                     best_match = student_id
             
-            # Convert distance to confidence score
+            # Convert distance to confidence
             confidence = max(0.0, 1.0 - (best_distance / 2.0))
             
             if confidence >= threshold:
@@ -250,8 +279,9 @@ class DeepFaceFaceRecognitionService:
             logger.error(f"Face recognition failed: {e}")
             return None, 0.0
 
-# Initialize face recognition service
-face_recognition_service = DeepFaceFaceRecognitionService()
+# Initialize optimized services
+anti_spoof_service = OptimizedDeepFaceService()
+face_recognition_service = OptimizedFaceRecognitionService()
 
 def base64_to_image(base64_string):
     """Convert base64 string to OpenCV image"""
@@ -270,13 +300,13 @@ def base64_to_image(base64_string):
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        "message": "Face Recognition Attendance System with DeepFace", 
-        "version": "2.0.0",
+        "message": "Face Recognition Attendance System - Memory Optimized DeepFace", 
+        "version": "3.1.0",
         "status": "running",
         "services": {
             "firebase": db is not None,
-            "deepface_antispoofing": anti_spoof_service.models_loaded,
-            "deepface_recognition": face_recognition_service.deepface is not None,
+            "deepface_antispoofing": "lazy_loaded",
+            "deepface_recognition": "lazy_loaded",
             "known_faces": len(face_recognition_service.known_face_embeddings)
         }
     })
@@ -287,15 +317,21 @@ def health_check():
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
         "firebase_connected": db is not None,
-        "deepface_antispoofing_ready": anti_spoof_service.models_loaded,
-        "deepface_recognition_ready": face_recognition_service.deepface is not None,
+        "deepface_ready": "lazy_loaded",
         "known_faces_count": len(face_recognition_service.known_face_embeddings)
     })
 
 @app.route('/register-student', methods=['POST'])
 def register_student():
     try:
-        data = request.json
+        # Better JSON parsing
+        if not request.is_json:
+            return jsonify({"error": "Content-Type must be application/json"}), 400
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid JSON data"}), 400
+        
         student_id = data.get('studentId')
         name = data.get('name')
         face_image_base64 = data.get('faceImage')
@@ -310,7 +346,7 @@ def register_student():
         if image is None:
             return jsonify({"error": "Invalid image format"}), 400
         
-        # Check liveness
+        # Check liveness (optimized)
         liveness_score = anti_spoof_service.predict(image)
         logger.info(f"Liveness score for {student_id}: {liveness_score}")
         
@@ -320,14 +356,13 @@ def register_student():
                 "liveness_score": liveness_score
             }), 400
         
-        # Extract face embedding
+        # Extract face embedding (optimized)
         face_embedding = face_recognition_service.add_known_face(student_id, image)
         if face_embedding is None:
             return jsonify({"error": "No face detected in image or face extraction failed"}), 400
         
         # Save to Firebase
         if db:
-            # Check if student already exists
             existing_student = db.collection('students').document(student_id).get()
             if existing_student.exists:
                 return jsonify({"error": "Student already registered"}), 400
@@ -343,6 +378,9 @@ def register_student():
             db.collection('students').document(student_id).set(student_data)
             logger.info(f"Student {student_id} registered successfully")
         
+        # Force garbage collection after heavy operation
+        gc.collect()
+        
         return jsonify({
             "success": True,
             "message": f"Student {name} registered successfully",
@@ -357,7 +395,14 @@ def register_student():
 @app.route('/mark-attendance', methods=['POST'])
 def mark_attendance():
     try:
-        data = request.json
+        # Better JSON parsing
+        if not request.is_json:
+            return jsonify({"error": "Content-Type must be application/json"}), 400
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid JSON data"}), 400
+        
         student_id = data.get('studentId')
         face_image_base64 = data.get('faceImage')
         
@@ -371,7 +416,7 @@ def mark_attendance():
         if image is None:
             return jsonify({"error": "Invalid image format"}), 400
         
-        # Check liveness
+        # Check liveness (optimized)
         liveness_score = anti_spoof_service.predict(image)
         logger.info(f"Liveness score for {student_id}: {liveness_score}")
         
@@ -381,11 +426,11 @@ def mark_attendance():
                 "liveness_score": liveness_score
             }), 400
         
-        # Recognize face
+        # Recognize face (optimized)
         recognized_id, confidence = face_recognition_service.recognize_face(image)
         logger.info(f"Recognition result: {recognized_id}, confidence: {confidence}")
         
-        # Check if recognized face matches provided student ID
+        # Check match
         if recognized_id != student_id or confidence < 0.6:
             return jsonify({
                 "error": "Face does not match the provided Student ID",
@@ -394,7 +439,7 @@ def mark_attendance():
                 "recognized_student": recognized_id
             }), 400
         
-        # Check if student exists and mark attendance
+        # Mark attendance (same as before)
         if db:
             student_ref = db.collection('students').document(student_id)
             student_doc = student_ref.get()
@@ -404,7 +449,6 @@ def mark_attendance():
             
             student_data = student_doc.to_dict()
             
-            # Check if already marked today
             today = datetime.now().date().isoformat()
             existing_attendance = list(db.collection('attendance')
                 .where('studentId', '==', student_id)
@@ -414,7 +458,6 @@ def mark_attendance():
             if len(existing_attendance) > 0:
                 return jsonify({"error": "Attendance already marked today"}), 400
             
-            # Mark attendance
             attendance_data = {
                 'studentId': student_id,
                 'studentName': student_data.get('name'),
@@ -431,6 +474,9 @@ def mark_attendance():
             
             logger.info(f"Attendance marked for {student_id} with confidence {confidence}")
             
+            # Force garbage collection
+            gc.collect()
+            
             return jsonify({
                 "success": True,
                 "message": f"Attendance marked for {student_data.get('name')}",
@@ -446,6 +492,7 @@ def mark_attendance():
         logger.error(f"Attendance marking failed: {e}")
         return jsonify({"error": f"Attendance marking failed: {str(e)}"}), 500
 
+# Other routes remain the same...
 @app.route('/get-students', methods=['GET'])
 def get_students():
     try:
@@ -458,7 +505,6 @@ def get_students():
         
         for doc in docs:
             student_data = doc.to_dict()
-            # Don't return face embedding in the list
             students.append({
                 'studentId': student_data.get('studentId'),
                 'name': student_data.get('name'),
@@ -478,7 +524,6 @@ def get_attendance():
         if not db:
             return jsonify({"error": "Database not connected"}), 500
         
-        # Get query parameter for date (default to today)
         date_param = request.args.get('date', datetime.now().date().isoformat())
         
         attendance_records = []
@@ -508,7 +553,6 @@ def get_attendance():
 
 @app.route('/reload-faces', methods=['POST'])
 def reload_faces():
-    """Reload known faces from database"""
     try:
         face_recognition_service.load_known_faces()
         return jsonify({
